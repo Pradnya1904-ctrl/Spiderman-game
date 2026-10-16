@@ -1,20 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image/color"
 	"log"
 	"math/rand"
-	"time"
+	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"github.com/hajimehoshi/ebiten/v2/audio/wav"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
 const (
 	screenWidth  = 800
 	screenHeight = 600
+	sampleRate   = 44100
 )
 
 type GameState int
@@ -49,10 +54,46 @@ type Game struct {
 	gwenSpawnTimer   int
 	peopleSpawnTimer int
 	monsterTimer     int
+
+	audioCtx      *audio.Context
+	soundWebData  []byte
+	soundSaveData []byte
+	soundOverData []byte
+}
+
+func loadSound(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("Warning: Could not load sound %s: %v", path, err)
+		return nil
+	}
+	return b
+}
+
+func (g *Game) playSound(data []byte) {
+	if data == nil || g.audioCtx == nil {
+		return
+	}
+	d, err := wav.DecodeWithoutResampling(bytes.NewReader(data))
+	if err != nil {
+		return
+	}
+
+	player, err := g.audioCtx.NewPlayer(d)
+	if err != nil {
+		return
+	}
+	player.Play()
 }
 
 func NewGame() *Game {
 	g := &Game{}
+	g.audioCtx = audio.NewContext(sampleRate)
+
+	g.soundWebData = loadSound("assets/web.wav")
+	g.soundSaveData = loadSound("assets/save.wav")
+	g.soundOverData = loadSound("assets/gameover.wav")
+
 	g.Reset()
 	return g
 }
@@ -75,14 +116,12 @@ func (g *Game) Reset() {
 }
 
 func (g *Game) Update() error {
-	rand.Seed(time.Now().UnixNano())
-
 	switch g.state {
 	case StateStart:
-		// Game starts when Spider-Man throws a web (Left Mouse Click or Spacebar)
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) || ebiten.IsKeyPressed(ebiten.KeySpace) {
 			g.state = StatePlaying
 			g.webActive = true
+			g.playSound(g.soundWebData)
 			if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 				cx, cy := ebiten.CursorPosition()
 				g.webTargetX = float32(cx)
@@ -94,7 +133,6 @@ func (g *Game) Update() error {
 		}
 
 	case StatePlaying:
-		// Move Player with Left/Right arrow keys or A/D
 		if ebiten.IsKeyPressed(ebiten.KeyLeft) || ebiten.IsKeyPressed(ebiten.KeyA) {
 			if g.playerX > 20 {
 				g.playerX -= 6
@@ -106,7 +144,10 @@ func (g *Game) Update() error {
 			}
 		}
 
-		// Web Action: Left Click shoots web to cursor position
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			g.playSound(g.soundWebData)
+		}
+
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 			cx, cy := ebiten.CursorPosition()
 			g.webActive = true
@@ -116,40 +157,36 @@ func (g *Game) Update() error {
 			g.webActive = false
 		}
 
-		// High Frequency Gwen Spawns (falls down frequently)
+		// Gwen Spawns
 		g.gwenSpawnTimer++
-		if !g.gwen.active && g.gwenSpawnTimer > 90 { // Spawns every ~1.5 seconds
+		if !g.gwen.active && g.gwenSpawnTimer > 90 {
 			g.gwen = GameObject{
 				x:      float32(rand.Intn(screenWidth - 40)),
 				y:      0,
 				width:  20,
 				height: 25,
-				speedY: 3.5, // High falling speed
+				speedY: 3.5,
 				active: true,
 			}
 			g.gwenSpawnTimer = 0
 		}
 
-		// Update Gwen position
 		if g.gwen.active {
 			g.gwen.y += g.gwen.speedY
 
-			// Check if saved by web or player proximity
-			if g.webActive && g.checkWebHit(g.gwen) {
+			if (g.webActive && g.checkWebHit(g.gwen)) || g.checkPlayerHit(g.gwen) {
 				g.gwen.active = false
 				g.score += 50
-			} else if g.checkPlayerHit(g.gwen) {
-				g.gwen.active = false
-				g.score += 50
+				g.playSound(g.soundSaveData)
 			}
 
-			// If Gwen falls past the bottom floor -> Game Over
 			if g.gwen.y > screenHeight {
 				g.state = StateGameOver
+				g.playSound(g.soundOverData)
 			}
 		}
 
-		// Spawn People needing rescue
+		// People Spawns
 		g.peopleSpawnTimer++
 		if g.peopleSpawnTimer > 120 {
 			g.people = append(g.people, GameObject{
@@ -163,7 +200,19 @@ func (g *Game) Update() error {
 			g.peopleSpawnTimer = 0
 		}
 
-		// Spawn Monsters
+		for i := range g.people {
+			if g.people[i].active {
+				g.people[i].y += g.people[i].speedY
+				if (g.webActive && g.checkWebHit(g.people[i])) || g.checkPlayerHit(g.people[i]) {
+					g.people[i].active = false
+					g.peopleSaved++
+					g.score += 20
+					g.playSound(g.soundSaveData)
+				}
+			}
+		}
+
+		// Monster Spawns
 		g.monsterTimer++
 		if g.monsterTimer > 150 {
 			g.monsters = append(g.monsters, GameObject{
@@ -177,29 +226,13 @@ func (g *Game) Update() error {
 			g.monsterTimer = 0
 		}
 
-		// Update People
-		for i := range g.people {
-			if g.people[i].active {
-				g.people[i].y += g.people[i].speedY
-
-				// Save civilian with web or player contact
-				if (g.webActive && g.checkWebHit(g.people[i])) || g.checkPlayerHit(g.people[i]) {
-					g.people[i].active = false
-					g.peopleSaved++
-					g.score += 20
-				}
-			}
-		}
-
-		// Update Monsters & check interactions
 		for i := range g.monsters {
 			if g.monsters[i].active {
 				g.monsters[i].y += g.monsters[i].speedY
-
-				// Defeat monster with web
 				if g.webActive && g.checkWebHit(g.monsters[i]) {
 					g.monsters[i].active = false
 					g.score += 30
+					g.playSound(g.soundSaveData)
 				}
 			}
 		}
@@ -217,7 +250,6 @@ func (g *Game) checkWebHit(obj GameObject) bool {
 	if !obj.active {
 		return false
 	}
-	// Check distance from target of the web to object
 	dx := g.webTargetX - (obj.x + obj.width/2)
 	dy := g.webTargetY - (obj.y + obj.height/2)
 	return (dx*dx + dy*dy) < 1200
@@ -234,7 +266,6 @@ func (g *Game) checkPlayerHit(obj GameObject) bool {
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
-	// Background
 	screen.Fill(color.RGBA{20, 24, 40, 255})
 
 	switch g.state {
@@ -243,37 +274,31 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		ebitenutil.DebugPrintAt(screen, "CLICK LEFT MOUSE BUTTON or PRESS SPACE to throw web & start!", screenWidth/2-210, screenHeight/2)
 
 	case StatePlaying:
-		// Draw Spider-Man (Red/Blue square)
 		vector.DrawFilledRect(screen, g.playerX, g.playerY, 30, 30, color.RGBA{220, 30, 30, 255}, false)
 		vector.DrawFilledRect(screen, g.playerX+5, g.playerY+20, 20, 10, color.RGBA{30, 30, 220, 255}, false)
 
-		// Draw Web line when clicking
 		if g.webActive {
 			vector.StrokeLine(screen, g.playerX+15, g.playerY, g.webTargetX, g.webTargetY, 2, color.RGBA{240, 240, 240, 220}, false)
 			vector.DrawFilledCircle(screen, g.webTargetX, g.webTargetY, 6, color.RGBA{255, 255, 255, 255}, false)
 		}
 
-		// Draw Gwen (Pink/Yellow square)
 		if g.gwen.active {
 			vector.DrawFilledRect(screen, g.gwen.x, g.gwen.y, g.gwen.width, g.gwen.height, color.RGBA{255, 105, 180, 255}, false)
-			vector.DrawFilledRect(screen, g.gwen.x+2, g.gwen.y, g.gwen.width-4, 6, color.RGBA{255, 220, 0, 255}, false) // Blonde hair
+			vector.DrawFilledRect(screen, g.gwen.x+2, g.gwen.y, g.gwen.width-4, 6, color.RGBA{255, 220, 0, 255}, false)
 		}
 
-		// Draw People (Green)
 		for _, p := range g.people {
 			if p.active {
 				vector.DrawFilledRect(screen, p.x, p.y, p.width, p.height, color.RGBA{40, 200, 80, 255}, false)
 			}
 		}
 
-		// Draw Monsters (Purple/Dark)
 		for _, m := range g.monsters {
 			if m.active {
 				vector.DrawFilledRect(screen, m.x, m.y, m.width, m.height, color.RGBA{140, 30, 180, 255}, false)
 			}
 		}
 
-		// HUD
 		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Score: %d | People Saved: %d", g.score, g.peopleSaved), 10, 10)
 		ebitenutil.DebugPrintAt(screen, "Controls: [A/D or Arrows] Move | [Left Click] Aim & Shoot Web", 10, 30)
 
